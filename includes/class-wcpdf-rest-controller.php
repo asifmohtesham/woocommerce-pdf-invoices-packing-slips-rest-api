@@ -2,30 +2,51 @@
 /**
  * REST controller for WP Overnight WCPDF document access keys.
  *
- * Namespace : wpo-wcpdf/v1
- * Base route: /access-key/{order_id}/{document_type}
+ * Registered under the WooCommerce REST API namespace (wc/v3) so that
+ * WooCommerce consumer_key / consumer_secret authentication applies
+ * automatically — no extra credentials or configuration required.
  *
- * Authentication uses the same WooCommerce consumer_key / consumer_secret
- * mechanism as the core WC REST API — no extra credentials needed.
+ * Namespace : wc/v3
+ * Base route: /wcpdf/access-key/{order_id}/{document_type}
+ *
+ * Full URL example:
+ *   GET /wp-json/wc/v3/wcpdf/access-key/237/invoice
+ *       ?consumer_key=ck_xxx&consumer_secret=cs_xxx
+ *
+ * Prerequisites
+ * -------------
+ * WP Overnight PDF Invoices must be configured with:
+ *   WP Admin → WooCommerce → PDF Invoices → Advanced settings
+ *   → Document link access type → "Full"
+ *
+ * In "Full" mode the plugin uses the WooCommerce order key as the access key,
+ * which is safe for unauthenticated clients to use because the order key is a
+ * unique, random, per-order token already exposed by the WooCommerce REST API.
+ *
+ * In "Logged in" mode (the plugin default) access keys are WordPress nonces
+ * that are only valid for an authenticated browser session — unauthenticated
+ * HTTP clients such as mobile apps cannot use them. This endpoint returns
+ * HTTP 409 with a clear error when the server is misconfigured that way.
  */
 
 defined( 'ABSPATH' ) || exit;
 
 class WCPDF_REST_Controller extends WP_REST_Controller {
 
-	/**
-	 * Supported WP Overnight document type slugs.
-	 */
+	/** WP Overnight document type slugs accepted by this endpoint. */
 	const DOCUMENT_TYPES = [ 'invoice', 'packing-slip', 'credit-note' ];
 
 	public function __construct() {
-		$this->namespace = 'wpo-wcpdf/v1';
-		$this->rest_base = 'access-key';
+		// Registering under wc/v3 ensures WooCommerce's determine_current_user
+		// hook authenticates consumer_key / consumer_secret requests here.
+		$this->namespace = 'wc/v3';
+		$this->rest_base = 'wcpdf/access-key';
 	}
 
-	/**
-	 * Register REST routes.
-	 */
+	// -------------------------------------------------------------------------
+	// Route registration
+	// -------------------------------------------------------------------------
+
 	public function register_routes(): void {
 		register_rest_route(
 			$this->namespace,
@@ -49,17 +70,12 @@ class WCPDF_REST_Controller extends WP_REST_Controller {
 	/**
 	 * Allows:
 	 *  - Shop managers / administrators (manage_woocommerce capability)
-	 *  - The customer who placed the order (matched by user ID)
-	 *
-	 * WooCommerce's determine_current_user hook applies to ALL REST routes, so
-	 * consumer_key / consumer_secret in the query string authenticate correctly
-	 * here without any extra configuration.
+	 *  - The customer who placed the order (matched by WordPress user ID)
 	 */
 	public function get_access_key_permissions_check( WP_REST_Request $request ): bool|WP_Error {
 		$order = wc_get_order( (int) $request['order_id'] );
 
 		if ( ! $order ) {
-			// Return false so WordPress issues a 401/403 before we hit the callback.
 			return new WP_Error(
 				'woocommerce_rest_order_not_found',
 				__( 'Order not found.', 'wcpdf-rest-api' ),
@@ -67,14 +83,11 @@ class WCPDF_REST_Controller extends WP_REST_Controller {
 			);
 		}
 
-		$user_id  = get_current_user_id();
-		$is_admin = current_user_can( 'manage_woocommerce' ) || current_user_can( 'manage_options' );
-
-		if ( $is_admin ) {
+		if ( current_user_can( 'manage_woocommerce' ) || current_user_can( 'manage_options' ) ) {
 			return true;
 		}
 
-		// Allow the customer who placed the order.
+		$user_id = get_current_user_id();
 		if ( $user_id > 0 && (int) $order->get_customer_id() === $user_id ) {
 			return true;
 		}
@@ -90,11 +103,8 @@ class WCPDF_REST_Controller extends WP_REST_Controller {
 	// Endpoint handler
 	// -------------------------------------------------------------------------
 
-	/**
-	 * Return the access key for a WP Overnight document.
-	 */
 	public function get_access_key( WP_REST_Request $request ): WP_REST_Response|WP_Error {
-		if ( ! function_exists( 'wcpdf_get_document' ) ) {
+		if ( ! function_exists( 'wcpdf_get_document' ) || ! function_exists( 'WPO_WCPDF' ) ) {
 			return new WP_Error(
 				'wcpdf_plugin_missing',
 				__( 'PDF Invoices & Packing Slips for WooCommerce is not active.', 'wcpdf-rest-api' ),
@@ -102,43 +112,55 @@ class WCPDF_REST_Controller extends WP_REST_Controller {
 			);
 		}
 
+		// Verify the server is in "full" access mode.
+		// In "logged_in" mode, access keys are WordPress nonces that require an
+		// active browser session — they cannot be used by unauthenticated clients.
+		$access_type = WPO_WCPDF()->endpoint->get_document_link_access_type();
+		if ( 'full' !== $access_type ) {
+			return new WP_Error(
+				'wcpdf_access_mode_incompatible',
+				sprintf(
+					/* translators: %s: current access mode slug */
+					__(
+						'WP Overnight PDF Invoices is configured with document link access type "%s". '
+						. 'Change it to "full" in WP Admin → WooCommerce → PDF Invoices → Advanced settings '
+						. 'so that unauthenticated clients can use the returned access key.',
+						'wcpdf-rest-api'
+					),
+					esc_html( $access_type )
+				),
+				[ 'status' => 409 ]
+			);
+		}
+
 		$order         = wc_get_order( (int) $request['order_id'] );
 		$document_type = sanitize_key( $request['document_type'] );
 
-		$document = wcpdf_get_document( $document_type, $order );
-
-		if ( ! $document ) {
-			return new WP_Error(
-				'wcpdf_document_unavailable',
-				sprintf(
-					/* translators: %s document type slug, e.g. "invoice" */
-					__( 'The "%s" document type is not supported or available.', 'wcpdf-rest-api' ),
-					$document_type
-				),
-				[ 'status' => 404 ]
-			);
+		// In "full" mode, WP Overnight uses $order->get_order_key() directly as
+		// the access key — it does not generate or store a separate key.
+		// We replicate that here rather than loading the document, which avoids
+		// triggering invoice number generation as a side-effect.
+		if ( $order instanceof WC_Order_Refund ) {
+			$parent = wc_get_order( $order->get_parent_id() );
+			$access_key = $parent ? $parent->get_order_key() : '';
+		} else {
+			$access_key = $order->get_order_key();
 		}
 
-		if ( ! $document->exists() ) {
+		if ( empty( $access_key ) ) {
 			return new WP_Error(
-				'wcpdf_document_not_generated',
-				sprintf(
-					/* translators: %s document type slug */
-					__( 'The "%s" has not been generated for this order yet.', 'wcpdf-rest-api' ),
-					$document_type
-				),
-				[ 'status' => 404 ]
+				'wcpdf_no_order_key',
+				__( 'Order key is missing — cannot generate access key.', 'wcpdf-rest-api' ),
+				[ 'status' => 500 ]
 			);
 		}
-
-		$access_key = $document->get_access_key();
 
 		return new WP_REST_Response(
-			$this->prepare_item_for_response( [
+			[
 				'order_id'      => $order->get_id(),
 				'document_type' => $document_type,
 				'access_key'    => $access_key,
-			], $request ),
+			],
 			200
 		);
 	}
@@ -146,17 +168,6 @@ class WCPDF_REST_Controller extends WP_REST_Controller {
 	// -------------------------------------------------------------------------
 	// Schema
 	// -------------------------------------------------------------------------
-
-	/**
-	 * Prepare the response data — passes through the array directly here since
-	 * the shape is already the final representation.
-	 *
-	 * @param array            $item
-	 * @param WP_REST_Request  $request
-	 */
-	public function prepare_item_for_response( $item, $request ): array {
-		return $item;
-	}
 
 	public function get_public_item_schema(): array {
 		return [
@@ -178,7 +189,7 @@ class WCPDF_REST_Controller extends WP_REST_Controller {
 					'readonly'    => true,
 				],
 				'access_key'    => [
-					'description' => __( 'Access key for the generate_wpo_wcpdf admin-ajax action.', 'wcpdf-rest-api' ),
+					'description' => __( 'WooCommerce order key used as the access key for the generate_wpo_wcpdf admin-ajax action (full access mode only).', 'wcpdf-rest-api' ),
 					'type'        => 'string',
 					'context'     => [ 'view' ],
 					'readonly'    => true,
@@ -198,18 +209,14 @@ class WCPDF_REST_Controller extends WP_REST_Controller {
 				'type'              => 'integer',
 				'required'          => true,
 				'sanitize_callback' => 'absint',
-				'validate_callback' => static function ( $value ): bool {
-					return is_numeric( $value ) && (int) $value > 0;
-				},
+				'validate_callback' => static fn( $v ): bool => is_numeric( $v ) && (int) $v > 0,
 			],
 			'document_type' => [
 				'description'       => __( 'Document type: invoice, packing-slip, or credit-note.', 'wcpdf-rest-api' ),
 				'type'              => 'string',
 				'required'          => true,
 				'sanitize_callback' => 'sanitize_key',
-				'validate_callback' => static function ( $value ): bool {
-					return in_array( $value, WCPDF_REST_Controller::DOCUMENT_TYPES, true );
-				},
+				'validate_callback' => static fn( $v ): bool => in_array( $v, WCPDF_REST_Controller::DOCUMENT_TYPES, true ),
 			],
 		];
 	}
